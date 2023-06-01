@@ -1,37 +1,67 @@
-use crate::os::unix::unixprelude::*;
+use crate::os::unix::{
+    udsocket::cmsg::{CmsgMut, CmsgRef},
+    unixprelude::*,
+};
 use cfg_if::cfg_if;
 use libc::{iovec, msghdr};
 use std::{
     ffi::{CStr, CString},
     hint::unreachable_unchecked,
     io::{self, IoSlice, IoSliceMut},
-    mem::zeroed,
+    ptr,
 };
 use to_method::To;
 
-#[allow(dead_code)]
-mod tname {
-    pub static SOCKLEN_T: &str = "`socklen_t`";
-    pub static SIZE_T: &str = "`size_t`";
-    pub static C_INT: &str = "`c_int`";
-}
+pub const DUMMY_MSGHDR: msghdr = msghdr {
+    msg_name: ptr::null_mut(),
+    msg_namelen: 0,
+    msg_iov: ptr::null_mut(),
+    msg_iovlen: 0,
+    msg_control: ptr::null_mut(),
+    msg_controllen: 0,
+    msg_flags: 0,
+};
+
+// TODO add type of cmsg_len
 
 cfg_if! {
     if #[cfg(uds_msghdr_iovlen_c_int)] {
         pub type MsghdrIovlen = c_int;
-        static MSGHDR_IOVLEN_NAME: &str = tname::C_INT;
+        macro_rules! msghdr_iovlen_name {
+            () => {"c_int"}
+        }
     } else if #[cfg(uds_msghdr_iovlen_size_t)] {
         pub type MsghdrIovlen = size_t;
-        static MSGHDR_IOVLEN_NAME: &str = tname::SIZE_T;
+        macro_rules! msghdr_iovlen_name {
+            () => {"size_t"}
+        }
     }
 }
 cfg_if! {
     if #[cfg(uds_msghdr_controllen_socklen_t)] {
         pub type MsghdrControllen = libc::socklen_t;
-        static MSGHDR_CONTROLLEN_NAME: &str = tname::SOCKLEN_T;
+        macro_rules! msghdr_controllen_name {
+            () => {"socklen_t"}
+        }
 } else if #[cfg(uds_msghdr_controllen_size_t)] {
         pub type MsghdrControllen = size_t;
-        static MSGHDR_CONTROLLEN_NAME: &str = tname::SIZE_T;
+        macro_rules! msghdr_controllen_name {
+            () => {"size_t"}
+        }
+    }
+}
+cfg_if! {
+    if #[cfg(uds_cmsghdr_len_socklen_t)] {
+        pub type CmsghdrLen = libc::socklen_t;
+        macro_rules! cmsghdr_len_name {
+            () => {"socklen_t"}
+        }
+    }
+    else if #[cfg(uds_cmsghdr_len_size_t)] {
+        pub type CmsghdrLen = libc::size_t;
+        macro_rules! cmsghdr_len_name {
+            () => {"size_t"}
+        }
     }
 }
 
@@ -39,7 +69,7 @@ pub fn to_msghdr_iovlen(iovlen: usize) -> io::Result<MsghdrIovlen> {
     iovlen.try_to::<MsghdrIovlen>().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("number of scatter-gather buffers overflowed {MSGHDR_IOVLEN_NAME}"),
+            concat!("number of scatter-gather buffers overflowed ", msghdr_iovlen_name!()),
         )
     })
 }
@@ -47,7 +77,15 @@ pub fn to_msghdr_controllen(controllen: usize) -> io::Result<MsghdrControllen> {
     controllen.try_to::<MsghdrControllen>().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("ancillary data buffer length overflowed {MSGHDR_CONTROLLEN_NAME}"),
+            concat!("control message buffer length overflowed ", msghdr_controllen_name!()),
+        )
+    })
+}
+pub fn to_cmsghdr_len<T: TryInto<CmsghdrLen>>(cmsg_len: T) -> io::Result<CmsghdrLen> {
+    cmsg_len.try_to::<CmsghdrLen>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            concat!("control message length overflowed ", cmsghdr_len_name!()),
         )
     })
 }
@@ -65,64 +103,29 @@ pub fn empty_cstr() -> &'static CStr {
     }
 }
 
-pub fn fill_out_msghdr_r(hdr: &mut msghdr, iov: &mut [IoSliceMut<'_>], anc: &mut [u8]) -> io::Result<()> {
+pub fn make_msghdr_r(bufs: &mut [IoSliceMut<'_>], abuf: &mut CmsgMut<'_>) -> io::Result<msghdr> {
+    let mut hdr = DUMMY_MSGHDR;
     _fill_out_msghdr(
-        hdr,
-        iov.as_ptr() as *mut _,
-        to_msghdr_iovlen(iov.len())?,
-        anc.as_mut_ptr(),
-        to_msghdr_controllen(anc.len())?,
-    )
+        &mut hdr,
+        bufs.as_mut_ptr().cast::<iovec>(),
+        to_msghdr_iovlen(bufs.len())?,
+    );
+    abuf.fill_msghdr(&mut hdr, true)?;
+    Ok(hdr)
 }
-pub fn fill_out_msghdr_w(hdr: &mut msghdr, iov: &[IoSlice<'_>], anc: &[u8]) -> io::Result<()> {
+pub fn make_msghdr_w(bufs: &[IoSlice<'_>], abuf: CmsgRef<'_>) -> io::Result<msghdr> {
+    let mut hdr = DUMMY_MSGHDR;
     _fill_out_msghdr(
-        hdr,
-        iov.as_ptr() as *mut _,
-        to_msghdr_iovlen(iov.len())?,
-        anc.as_ptr() as *mut _,
-        to_msghdr_controllen(anc.len())?,
-    )
+        &mut hdr,
+        bufs.as_ptr().cast_mut().cast::<iovec>(),
+        to_msghdr_iovlen(bufs.len())?,
+    );
+    abuf.fill_msghdr(&mut hdr)?;
+    Ok(hdr)
 }
-fn _fill_out_msghdr(
-    hdr: &mut msghdr,
-    iov: *mut iovec,
-    iovlen: MsghdrIovlen,
-    control: *mut u8,
-    controllen: MsghdrControllen,
-) -> io::Result<()> {
+fn _fill_out_msghdr(hdr: &mut msghdr, iov: *mut iovec, iovlen: MsghdrIovlen) {
     hdr.msg_iov = iov;
     hdr.msg_iovlen = iovlen;
-    hdr.msg_control = control as *mut _;
-    hdr.msg_controllen = controllen;
-    Ok(())
-}
-pub fn mk_msghdr_r(iov: &mut [IoSliceMut<'_>], anc: &mut [u8]) -> io::Result<msghdr> {
-    let mut hdr = unsafe {
-        // SAFETY: msghdr is plain old data, i.e. an all-zero pattern is allowed
-        zeroed()
-    };
-    fill_out_msghdr_r(&mut hdr, iov, anc)?;
-    Ok(hdr)
-}
-pub fn mk_msghdr_w(iov: &[IoSlice<'_>], anc: &[u8]) -> io::Result<msghdr> {
-    let mut hdr = unsafe {
-        // SAFETY: msghdr is plain old data, i.e. an all-zero pattern is allowed
-        zeroed()
-    };
-    fill_out_msghdr_w(&mut hdr, iov, anc)?;
-    Ok(hdr)
-}
-pub fn check_ancillary_unsound() -> io::Result<()> {
-    if cfg!(uds_ancillary_unsound) {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "\
-ancillary data has been disabled for non-x86 ISAs in a hotfix because it \
-doesn't account for alignment",
-        ))
-    } else {
-        Ok(())
-    }
 }
 
 pub fn eunreachable<T, U>(_e: T) -> U {

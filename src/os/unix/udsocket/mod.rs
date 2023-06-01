@@ -16,13 +16,12 @@ pub mod cmsg;
 #[cfg_attr(feature = "doc_cfg", doc(cfg(feature = "tokio")))]
 pub mod tokio;
 
-mod ancillary_old;
 mod listener;
 mod path;
 mod socket;
 mod stream;
 mod util;
-pub use {ancillary_old::*, cmsg::*, listener::*, path::*, socket::*, stream::*};
+pub use {listener::*, path::*, socket::*, stream::*};
 
 mod path_drop_guard;
 use path_drop_guard::*;
@@ -59,14 +58,19 @@ use std::mem::size_of;
 ///
 /// [`UdStreamListener::bind`]: struct.UdStreamListener.html#method.bind " "
 /// [socket namespace]: enum.UdSocketPath.html#namespaced " "
-// The reason why this constant wraps the underscored one instead of being defined directly is
-// because that'd require documenting both branches separately. This way, the user-faced
-// constant has only one definition and one documentation comment block.
 pub const MAX_UDSOCKET_PATH_LEN: usize = {
-    const LENGTH: usize = size_of::<sockaddr_un>() - size_of::<sa_family_t>();
+    const LENGTH: usize = {
+        let mut length = size_of::<sockaddr_un>() - size_of::<sa_family_t>();
+        if cfg!(uds_sun_len) {
+            length -= 1;
+        }
+        length
+    };
     // Validates the calculated length and generates a cryptic compile error
     // if we guessed wrong, which isn't supposed to happen on any sane platform.
     let _ = sockaddr_un {
+        #[cfg(uds_sun_len)]
+        sun_len: 0,
         sun_family: 0,
         sun_path: [0; LENGTH],
     };
